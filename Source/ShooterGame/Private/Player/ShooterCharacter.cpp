@@ -9,6 +9,10 @@
 #include "Animation/AnimInstance.h"
 #include "Sound/SoundNodeLocalPlayer.h"
 #include "AudioThread.h"
+#include "MyAbilitySystemComponent.h"
+#include "MyAttributeSet.h"
+#include "MyGameplayAbility.h"
+#include <GameplayEffectTypes.h>
 
 static int32 NetVisualizeRelevancyTestPoints = 0;
 FAutoConsoleVariableRef CVarNetVisualizeRelevancyTestPoints(
@@ -26,6 +30,7 @@ FAutoConsoleVariableRef CVarNetEnablePauseRelevancy(
 	TEXT("")
 	TEXT("0: Disable, 1: Enable"),
 	ECVF_Cheat);
+
 
 FOnShooterCharacterEquipWeapon AShooterCharacter::NotifyEquipWeapon;
 FOnShooterCharacterUnEquipWeapon AShooterCharacter::NotifyUnEquipWeapon;
@@ -58,6 +63,19 @@ AShooterCharacter::AShooterCharacter(const FObjectInitializer& ObjectInitializer
 	GetCapsuleComponent()->SetCollisionResponseToChannel(COLLISION_PROJECTILE, ECR_Block);
 	GetCapsuleComponent()->SetCollisionResponseToChannel(COLLISION_WEAPON, ECR_Ignore);
 
+	// Our ability system component.
+	AbilitySystemComponent = CreateDefaultSubobject<UMyAbilitySystemComponent>(TEXT("AbilitySystemComp"));
+	AbilitySystemComponent->SetIsReplicated(true);
+	//	Minimal 모두에게 최소한의 게임정보만을 복제
+	//	Mixed 소유자 및 자율 프록시에게 전체정보를, 시뮬레이션 프록시에는 최소한의 정보만 복제
+	//	Full 전체 게임플레이 정보를 모두에게 복제
+	AbilitySystemComponent->SetReplicationMode(EGameplayEffectReplicationMode::Minimal);
+
+	
+	Attributes = CreateDefaultSubobject<UMyAttributeSet>("Attributes");
+
+	ReloadAbilityTag = FGameplayTag::RequestGameplayTag(FName("Gun.Reload"));
+
 	TargetingSpeedModifier = 0.5f;
 	bIsTargeting = false;
 	RunningSpeedModifier = 1.5f;
@@ -67,6 +85,42 @@ AShooterCharacter::AShooterCharacter(const FObjectInitializer& ObjectInitializer
 
 	BaseTurnRate = 45.f;
 	BaseLookUpRate = 45.f;
+	
+}
+
+void AShooterCharacter::OnApplyGameplayEffectCallback(UAbilitySystemComponent* Target,
+	const FGameplayEffectSpec& SpecApplied, FActiveGameplayEffectHandle ActiveHandle)
+{
+	AActor* AvatarActor = Target ? Target->GetAvatarActor_Direct() : nullptr;
+	if (AvatarActor)
+	{
+		LastAttacker = AvatarActor;
+	}
+}
+
+void AShooterCharacter::HealthChanged(const FOnAttributeChangeData& Data)
+{
+	if (GetLocalRole() < ROLE_Authority) return; // 서버가 아닌경우 x -> 들어오는곳 플레이어 자신, 서버
+	
+	float ActualDamage = Data.OldValue - Data.NewValue;
+	if (0.f >= ActualDamage) // 그대로거나 회복된경우
+	{
+		return;
+	}
+	
+	if (GetHealth() <= 0) // 체력이 없는경우.
+	{
+		if (LastAttacker.Get())
+		{
+			Die(ActualDamage, FDamageEvent(), LastAttacker->GetInstigatorController(), LastAttacker.Get());
+		}
+		else
+		{
+			Die(ActualDamage, FDamageEvent(), nullptr, nullptr);
+		}
+	}
+
+	MakeNoise(1.0f, this);
 }
 
 void AShooterCharacter::PostInitializeComponents()
@@ -75,7 +129,7 @@ void AShooterCharacter::PostInitializeComponents()
 
 	if (GetLocalRole() == ROLE_Authority)
 	{
-		Health = GetMaxHealth();
+		SetHealth(GetMaxHealth());
 
 		// Needs to happen after character is added to repgraph
 		GetWorldTimerManager().SetTimerForNextTick(this, &AShooterCharacter::SpawnDefaultInventory);
@@ -85,7 +139,7 @@ void AShooterCharacter::PostInitializeComponents()
 	UpdatePawnMeshes();
 
 	// create material instance for setting team colors (3rd person view)
-	for (int32 iMat = 0; iMat < GetMesh()->GetNumMaterials(); iMat++)
+	for(int32 iMat = 0; iMat < GetMesh()->GetNumMaterials(); iMat++)
 	{
 		MeshMIDs.Add(GetMesh()->CreateAndSetMaterialInstanceDynamic(iMat));
 	}
@@ -126,15 +180,21 @@ void AShooterCharacter::PawnClientRestart()
 	UpdateTeamColors(Mesh1PMID);
 }
 
-void AShooterCharacter::PossessedBy(class AController* InController)
+void AShooterCharacter::PossessedBy(class AController* InController) // 서버단 
 {
 	Super::PossessedBy(InController);
-
+	
 	// [server] as soon as PlayerState is assigned, set team colors of this pawn for local player
 	UpdateTeamColorsAllMIDs();
+
+	// Server ability init.
+	AbilitySystemComponent->InitAbilityActorInfo(this, this);
+	
+	InitializeAttributes(); // 어빌리티 초기화 서버에서만 작동.
+	GiveAbilities(); // 어빌리티 등록 - 반드시 서버에서만 등록
 }
 
-void AShooterCharacter::OnRep_PlayerState()
+void AShooterCharacter::OnRep_PlayerState() // 클라
 {
 	Super::OnRep_PlayerState();
 
@@ -143,6 +203,7 @@ void AShooterCharacter::OnRep_PlayerState()
 	{
 		UpdateTeamColorsAllMIDs();
 	}
+	BindASC();
 }
 
 FRotator AShooterCharacter::GetAimOffsets() const
@@ -230,7 +291,7 @@ void AShooterCharacter::OnCameraUpdate(const FVector& CameraLocation, const FRot
 
 void AShooterCharacter::FellOutOfWorld(const class UDamageType& dmgType)
 {
-	Die(Health, FDamageEvent(dmgType.GetClass()), NULL, NULL);
+	Die(GetHealth(), FDamageEvent(dmgType.GetClass()), NULL, NULL);
 }
 
 void AShooterCharacter::Suicide()
@@ -249,20 +310,24 @@ void AShooterCharacter::KilledBy(APawn* EventInstigator)
 			LastHitBy = NULL;
 		}
 
-		Die(Health, FDamageEvent(UDamageType::StaticClass()), Killer, NULL);
+		Die(GetHealth(), FDamageEvent(UDamageType::StaticClass()), Killer, NULL);
 	}
 }
 
 
 float AShooterCharacter::TakeDamage(float Damage, struct FDamageEvent const& DamageEvent, class AController* EventInstigator, class AActor* DamageCauser)
 {
+	// healthChanged()함수에 기능이 이전됨. 만약 불린다면 문제가 있는것 2021.09.13 11:40 조익상
+	UE_LOG(LogTemp, Warning, TEXT("TakeDamage is Calling, ApplyDamage() is calling somewhere."));
+	checkNoEntry();
+	return Super::TakeDamage(Damage, DamageEvent, EventInstigator, DamageCauser);
 	AShooterPlayerController* MyPC = Cast<AShooterPlayerController>(Controller);
 	if (MyPC && MyPC->HasGodMode())
 	{
 		return 0.f;
 	}
 
-	if (Health <= 0.f)
+	if (GetHealth() <= 0.f)
 	{
 		return 0.f;
 	}
@@ -274,8 +339,8 @@ float AShooterCharacter::TakeDamage(float Damage, struct FDamageEvent const& Dam
 	const float ActualDamage = Super::TakeDamage(Damage, DamageEvent, EventInstigator, DamageCauser);
 	if (ActualDamage > 0.f)
 	{
-		Health -= ActualDamage;
-		if (Health <= 0)
+		SetHealth(GetHealth()- ActualDamage);
+		if (GetHealth() <= 0)
 		{
 			Die(ActualDamage, DamageEvent, EventInstigator, DamageCauser);
 		}
@@ -313,7 +378,7 @@ bool AShooterCharacter::Die(float KillingDamage, FDamageEvent const& DamageEvent
 		return false;
 	}
 
-	Health = FMath::Min(0.0f, Health);
+	SetHealth(FMath::Min(0.0f, GetHealth()));
 
 	// if this is an environmental death then refer to the previous killer so that they receive credit (knocked into lava pits, etc)
 	UDamageType const* const DamageType = DamageEvent.DamageTypeClass ? DamageEvent.DamageTypeClass->GetDefaultObject<UDamageType>() : GetDefault<UDamageType>();
@@ -565,7 +630,7 @@ void AShooterCharacter::SpawnDefaultInventory()
 	}
 
 	int32 NumWeaponClasses = DefaultInventoryClasses.Num();
-	for (int32 i = 0; i < NumWeaponClasses; i++)
+	for(int32 i = 0; i < NumWeaponClasses; i++)
 	{
 		if (DefaultInventoryClasses[i])
 		{
@@ -591,7 +656,7 @@ void AShooterCharacter::DestroyInventory()
 	}
 
 	// remove all weapons from inventory and destroy them
-	for (int32 i = Inventory.Num() - 1; i >= 0; i--)
+	for(int32 i = Inventory.Num() - 1; i >= 0; i--)
 	{
 		AShooterWeapon* Weapon = Inventory[i];
 		if (Weapon)
@@ -622,7 +687,7 @@ void AShooterCharacter::RemoveWeapon(AShooterWeapon* Weapon)
 
 AShooterWeapon* AShooterCharacter::FindWeapon(TSubclassOf<AShooterWeapon> WeaponClass)
 {
-	for (int32 i = 0; i < Inventory.Num(); i++)
+	for(int32 i = 0; i < Inventory.Num(); i++)
 	{
 		if (Inventory[i] && Inventory[i]->IsA(WeaponClass))
 		{
@@ -858,18 +923,7 @@ void AShooterCharacter::SetupPlayerInputComponent(class UInputComponent* PlayerI
 	PlayerInputComponent->BindAxis("TurnRate", this, &AShooterCharacter::TurnAtRate);
 	PlayerInputComponent->BindAxis("LookUp", this, &APawn::AddControllerPitchInput);
 	PlayerInputComponent->BindAxis("LookUpRate", this, &AShooterCharacter::LookUpAtRate);
-
-	AShooterPlayerController* MyPC = Cast<AShooterPlayerController>(Controller);
-	if (MyPC->bAnalogFireTrigger)
-	{
-		PlayerInputComponent->BindAxis("FireTrigger", this, &AShooterCharacter::FireTrigger);
-	}
-	else
-	{
-		PlayerInputComponent->BindAction("Fire", IE_Pressed, this, &AShooterCharacter::OnStartFire);
-		PlayerInputComponent->BindAction("Fire", IE_Released, this, &AShooterCharacter::OnStopFire);
-	}
-
+	
 	PlayerInputComponent->BindAction("Targeting", IE_Pressed, this, &AShooterCharacter::OnStartTargeting);
 	PlayerInputComponent->BindAction("Targeting", IE_Released, this, &AShooterCharacter::OnStopTargeting);
 
@@ -878,26 +932,8 @@ void AShooterCharacter::SetupPlayerInputComponent(class UInputComponent* PlayerI
 
 	PlayerInputComponent->BindAction("Reload", IE_Pressed, this, &AShooterCharacter::OnReload);
 
-	PlayerInputComponent->BindAction("Jump", IE_Pressed, this, &AShooterCharacter::OnStartJump);
-	PlayerInputComponent->BindAction("Jump", IE_Released, this, &AShooterCharacter::OnStopJump);
-
-	PlayerInputComponent->BindAction("Run", IE_Pressed, this, &AShooterCharacter::OnStartRunning);
-	PlayerInputComponent->BindAction("RunToggle", IE_Pressed, this, &AShooterCharacter::OnStartRunningToggle);
-	PlayerInputComponent->BindAction("Run", IE_Released, this, &AShooterCharacter::OnStopRunning);
-}
-
-
-void AShooterCharacter::FireTrigger(float Val)
-{
-	AShooterPlayerController* MyPC = Cast<AShooterPlayerController>(Controller);
-	if (bWantsToFire && Val < MyPC->FireTriggerThreshold)
-	{
-		OnStopFire();
-	}
-	else if (!bWantsToFire && Val >= MyPC->FireTriggerThreshold)
-	{
-		OnStartFire();
-	}
+	BindASC();
+	
 }
 
 void AShooterCharacter::MoveForward(float Val)
@@ -948,24 +984,6 @@ void AShooterCharacter::LookUpAtRate(float Val)
 	AddControllerPitchInput(Val * BaseLookUpRate * GetWorld()->GetDeltaSeconds());
 }
 
-void AShooterCharacter::OnStartFire()
-{
-	AShooterPlayerController* MyPC = Cast<AShooterPlayerController>(Controller);
-	if (MyPC && MyPC->IsGameInputAllowed())
-	{
-		if (IsRunning())
-		{
-			SetRunning(false, false);
-		}
-		StartWeaponFire();
-	}
-}
-
-void AShooterCharacter::OnStopFire()
-{
-	StopWeaponFire();
-}
-
 void AShooterCharacter::OnStartTargeting()
 {
 	AShooterPlayerController* MyPC = Cast<AShooterPlayerController>(Controller);
@@ -1014,47 +1032,11 @@ void AShooterCharacter::OnPrevWeapon()
 
 void AShooterCharacter::OnReload()
 {
-	AShooterPlayerController* MyPC = Cast<AShooterPlayerController>(Controller);
-	if (MyPC && MyPC->IsGameInputAllowed())
+	if (AbilitySystemComponent)
 	{
-		if (CurrentWeapon)
-		{
-			CurrentWeapon->StartReload();
-		}
+		FGameplayTagContainer TempTagContainer(ReloadAbilityTag);
+		AbilitySystemComponent->TryActivateAbilitiesByTag(TempTagContainer);
 	}
-}
-
-void AShooterCharacter::OnStartRunning()
-{
-	AShooterPlayerController* MyPC = Cast<AShooterPlayerController>(Controller);
-	if (MyPC && MyPC->IsGameInputAllowed())
-	{
-		if (IsTargeting())
-		{
-			SetTargeting(false);
-		}
-		StopWeaponFire();
-		SetRunning(true, false);
-	}
-}
-
-void AShooterCharacter::OnStartRunningToggle()
-{
-	AShooterPlayerController* MyPC = Cast<AShooterPlayerController>(Controller);
-	if (MyPC && MyPC->IsGameInputAllowed())
-	{
-		if (IsTargeting())
-		{
-			SetTargeting(false);
-		}
-		StopWeaponFire();
-		SetRunning(true, true);
-	}
-}
-
-void AShooterCharacter::OnStopRunning()
-{
-	SetRunning(false, false);
 }
 
 bool AShooterCharacter::IsRunning() const
@@ -1071,28 +1053,11 @@ void AShooterCharacter::Tick(float DeltaSeconds)
 {
 	Super::Tick(DeltaSeconds);
 
-	if (bWantsToRunToggled && !IsRunning())
-	{
-		SetRunning(false, false);
-	}
-	AShooterPlayerController* MyPC = Cast<AShooterPlayerController>(Controller);
-	if (MyPC && MyPC->HasHealthRegen())
-	{
-		if (this->Health < this->GetMaxHealth())
-		{
-			this->Health += 5 * DeltaSeconds;
-			if (Health > this->GetMaxHealth())
-			{
-				Health = this->GetMaxHealth();
-			}
-		}
-	}
-
 	if (GEngine->UseSound())
 	{
 		if (LowHealthSound)
 		{
-			if ((this->Health > 0 && this->Health < this->GetMaxHealth() * LowHealthPercentage) && (!LowHealthWarningPlayer || !LowHealthWarningPlayer->IsPlaying()))
+			if ((this->GetHealth() > 0 && this->GetHealth() < this->GetMaxHealth() * LowHealthPercentage) && (!LowHealthWarningPlayer || !LowHealthWarningPlayer->IsPlaying()))
 			{
 				LowHealthWarningPlayer = UGameplayStatics::SpawnSoundAttached(LowHealthSound, GetRootComponent(),
 					NAME_None, FVector(ForceInit), EAttachLocation::KeepRelativeOffset, true);
@@ -1101,14 +1066,14 @@ void AShooterCharacter::Tick(float DeltaSeconds)
 					LowHealthWarningPlayer->SetVolumeMultiplier(0.0f);
 				}
 			}
-			else if ((this->Health > this->GetMaxHealth() * LowHealthPercentage || this->Health < 0) && LowHealthWarningPlayer && LowHealthWarningPlayer->IsPlaying())
+			else if ((this->GetHealth() > this->GetMaxHealth() * LowHealthPercentage || this->GetHealth() < 0) && LowHealthWarningPlayer && LowHealthWarningPlayer->IsPlaying())
 			{
 				LowHealthWarningPlayer->Stop();
 			}
 			if (LowHealthWarningPlayer && LowHealthWarningPlayer->IsPlaying())
 			{
 				const float MinVolume = 0.3f;
-				const float VolumeMultiplier = (1.0f - (this->Health / (this->GetMaxHealth() * LowHealthPercentage)));
+				const float VolumeMultiplier = (1.0f - (this->GetHealth() / (this->GetMaxHealth() * LowHealthPercentage)));
 				LowHealthWarningPlayer->SetVolumeMultiplier(MinVolume + (1.0f - MinVolume) * VolumeMultiplier);
 			}
 		}
@@ -1129,9 +1094,84 @@ void AShooterCharacter::Tick(float DeltaSeconds)
 
 	if (NetVisualizeRelevancyTestPoints == 1)
 	{
-		for (FVector PointToTest : PointsToTest)
+		for(FVector PointToTest : PointsToTest)
 		{
 			DrawDebugSphere(GetWorld(), PointToTest, 10.0f, 8, FColor::Red);
+		}
+	}
+}
+void AShooterCharacter::BeginPlay()
+{
+	Super::BeginPlay();
+
+	if (AbilitySystemComponent)
+	{
+		// Attribute change callbacks
+		FHealthChangedDelegateHandle = AbilitySystemComponent->GetGameplayAttributeValueChangeDelegate(Attributes->GetHealthAttribute()).AddUObject(this, &AShooterCharacter::HealthChanged);
+	
+		AbilitySystemComponent->OnGameplayEffectAppliedDelegateToSelf.AddUObject(this, &AShooterCharacter::OnApplyGameplayEffectCallback);
+	}
+	ApplyDefaultEffects();
+}
+
+void AShooterCharacter::BindASC()
+{
+	if (!bASCInputBound && AbilitySystemComponent && InputComponent)
+	{
+		const FGameplayAbilityInputBinds Binds("Confirm", "Cancel", "EAbilityInput",
+			static_cast<int32>(EAbilityInput::Confirm),static_cast<int32>(EAbilityInput::Cancel));
+		AbilitySystemComponent->BindAbilityActivationToInputComponent(InputComponent, Binds);
+		bASCInputBound = true;
+	}
+}
+
+UAbilitySystemComponent* AShooterCharacter::GetAbilitySystemComponent() const
+{
+	return AbilitySystemComponent;
+}
+
+void AShooterCharacter::InitializeAttributes()
+{
+	// 이팩트는 클라이언트에선 적용되지않음. 오직 서버에서만  
+	if (AbilitySystemComponent && DefaultAttributeEffect)
+	{
+		FGameplayEffectContextHandle EffectContext = AbilitySystemComponent->MakeEffectContext();
+		EffectContext.AddSourceObject(this);
+
+		FGameplayEffectSpecHandle SpecHandle = AbilitySystemComponent->MakeOutgoingSpec(DefaultAttributeEffect, 1, EffectContext);
+
+		if (SpecHandle.IsValid())
+		{
+			FActiveGameplayEffectHandle GEHandle = AbilitySystemComponent->ApplyGameplayEffectSpecToSelf(*SpecHandle.Data.Get());
+		}
+	}
+}
+
+void AShooterCharacter::GiveAbilities()
+{
+	// play Only Server
+	if (GetLocalRole() == ROLE_Authority  && AbilitySystemComponent)
+	{
+		for(const TSubclassOf<UMyGameplayAbility>& StartupAbility : DefaultAbilities)
+		{
+			if (IsValid(StartupAbility))
+			{
+				AbilitySystemComponent->GiveAbility(
+				FGameplayAbilitySpec(StartupAbility, 1, static_cast<int32>(StartupAbility.GetDefaultObject()->AbilityInputID),this));
+			}
+		}
+	}
+}
+
+void AShooterCharacter::ApplyDefaultEffects()
+{
+	if (GetLocalRole() < ROLE_Authority) return;
+		
+	if (AbilitySystemComponent)
+	{
+		for(TSubclassOf<class UGameplayEffect> MyEffect : MyGameplayEffects)
+		{
+			AbilitySystemComponent->ApplyGameplayEffectToSelf(MyEffect.GetDefaultObject(), 0.f, FGameplayEffectContextHandle());
 		}
 	}
 }
@@ -1148,21 +1188,6 @@ void AShooterCharacter::BeginDestroy()
 			USoundNodeLocalPlayer::GetLocallyControlledActorCache().Remove(UniqueID);
 		});
 	}
-}
-
-void AShooterCharacter::OnStartJump()
-{
-	AShooterPlayerController* MyPC = Cast<AShooterPlayerController>(Controller);
-	if (MyPC && MyPC->IsGameInputAllowed())
-	{
-		bPressedJump = true;
-	}
-}
-
-void AShooterCharacter::OnStopJump()
-{
-	bPressedJump = false;
-	StopJumping();
 }
 
 //////////////////////////////////////////////////////////////////////////
@@ -1191,7 +1216,6 @@ void AShooterCharacter::GetLifetimeReplicatedProps(TArray< FLifetimeProperty > &
 
 	// everyone
 	DOREPLIFETIME(AShooterCharacter, CurrentWeapon);
-	DOREPLIFETIME(AShooterCharacter, Health);
 }
 
 bool AShooterCharacter::IsReplicationPausedForConnection(const FNetViewer& ConnectionOwnerNetViewer)
@@ -1211,7 +1235,7 @@ bool AShooterCharacter::IsReplicationPausedForConnection(const FNetViewer& Conne
 		TArray<FVector> PointsToTest;
 		BuildPauseReplicationCheckPoints(PointsToTest);
 
-		for (FVector PointToTest : PointsToTest)
+		for(FVector PointToTest : PointsToTest)
 		{
 			if (!GetWorld()->LineTraceTestByChannel(PointToTest, ViewLocation, ECC_Visibility, CollisionParams))
 			{
@@ -1245,9 +1269,22 @@ AShooterWeapon* AShooterCharacter::GetInventoryWeapon(int32 index) const
 	return Inventory[index];
 }
 
-USkeletalMeshComponent* AShooterCharacter::GetPawnMesh() const
+USkeletalMeshComponent* AShooterCharacter::GetPawnMesh(EBodyMeshType ViewType) const
 {
-	return IsFirstPerson() ? Mesh1P : GetMesh();
+	switch(ViewType)
+	{
+	case EBodyMeshType::None:
+		return IsFirstPerson() ? Mesh1P : GetMesh();
+		break;
+	case EBodyMeshType::FirstPerson:
+		return Mesh1P;
+		break;
+	case EBodyMeshType::ThirdPerson:
+		return GetMesh();
+		break;
+	default:
+		return IsFirstPerson() ? Mesh1P : GetMesh();
+	}
 }
 
 USkeletalMeshComponent* AShooterCharacter::GetSpecifcPawnMesh(bool WantFirstPerson) const
@@ -1285,14 +1322,60 @@ bool AShooterCharacter::IsFirstPerson() const
 	return IsAlive() && Controller && Controller->IsLocalPlayerController();
 }
 
-int32 AShooterCharacter::GetMaxHealth() const
+float AShooterCharacter::GetHealth() const
+{
+	if (IsValid(Attributes))
+	{
+		return Attributes->GetHealth();
+	}
+
+	return 0.0f;
+}
+
+void AShooterCharacter::SetHealth(float NewHealth)
+{
+	if (IsValid(Attributes))
+	{
+		Attributes->SetHealth(NewHealth);
+	}
+}
+
+float AShooterCharacter::GetMaxHealth() const
+{
+	if (IsValid(Attributes))
+	{
+		return Attributes->GetMaxHealth();
+	}
+
+	return 0.0f;
+}
+
+float AShooterCharacter::GetAdditionalMoveSpeed() const
+{
+	if (IsValid(Attributes))
+	{
+		return Attributes->GetMoveSpeed();
+	}
+
+	return 0.0f;
+}
+
+void AShooterCharacter::SetAdditionalMoveSpeed(float NewSpeed)
+{
+	if (IsValid(Attributes))
+	{
+		Attributes->SetMoveSpeed(NewSpeed);
+	}
+}
+
+/*int32 AShooterCharacter::GetMaxHealth() const
 {
 	return GetClass()->GetDefaultObject<AShooterCharacter>()->Health;
-}
+}*/
 
 bool AShooterCharacter::IsAlive() const
 {
-	return Health > 0;
+	return GetHealth() > 0;
 }
 
 float AShooterCharacter::GetLowHealthPercentage() const
@@ -1302,7 +1385,7 @@ float AShooterCharacter::GetLowHealthPercentage() const
 
 void AShooterCharacter::UpdateTeamColorsAllMIDs()
 {
-	for (int32 i = 0; i < MeshMIDs.Num(); ++i)
+	for(int32 i = 0; i < MeshMIDs.Num(); ++i)
 	{
 		UpdateTeamColors(MeshMIDs[i]);
 	}

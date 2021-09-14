@@ -3,17 +3,62 @@
 #pragma once
 
 #include "ShooterTypes.h"
+#include "AbilitySystemInterface.h"
+#include <GameplayEffectTypes.h>
 #include "ShooterCharacter.generated.h"
 
 DECLARE_MULTICAST_DELEGATE_TwoParams(FOnShooterCharacterEquipWeapon, AShooterCharacter*, AShooterWeapon* /* new */);
 DECLARE_MULTICAST_DELEGATE_TwoParams(FOnShooterCharacterUnEquipWeapon, AShooterCharacter*, AShooterWeapon* /* old */);
 
+UENUM(BlueprintType)
+enum class EBodyMeshType : uint8
+{
+	None		UMETA(DisplayName = "Option A"),
+	FirstPerson	UMETA(DisplayName = "Option A"),
+	ThirdPerson UMETA(DisplayName = "Option A")
+};
+
 UCLASS(Abstract)
-class AShooterCharacter : public ACharacter
+class AShooterCharacter : public ACharacter, public IAbilitySystemInterface
 {
 	GENERATED_UCLASS_BODY()
 
+private:
+	/** Our ability system */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = Abilities, meta = (AllowPrivateAccess = "true"))
+	class UMyAbilitySystemComponent* AbilitySystemComponent;
+
+	UPROPERTY()
+	class UMyAttributeSet* Attributes;
+
+	UPROPERTY(BlueprintReadOnly, EditDefaultsOnly, Category = "Ability", meta = (AllowPrivateAccess = "true"))
+	TSubclassOf<class UGameplayEffect> DefaultAttributeEffect;
+
+	UPROPERTY(BlueprintReadOnly, EditDefaultsOnly, Category = "Ability", meta = (AllowPrivateAccess = "true"))
+	TArray<TSubclassOf<class UMyGameplayAbility>> DefaultAbilities;
+
+	UPROPERTY(BlueprintReadOnly, EditDefaultsOnly, Category = "Ability", meta = (AllowPrivateAccess = "true"))
+	TArray<TSubclassOf<class UGameplayEffect>> MyGameplayEffects;
+
+	void ApplyDefaultEffects();
+	
 	virtual void BeginDestroy() override;
+
+	virtual void BeginPlay() override;
+
+	void BindASC();
+
+	bool bASCInputBound = false;
+	
+	FGameplayTag ReloadAbilityTag;
+
+	FDelegateHandle FHealthChangedDelegateHandle;
+	
+	void OnApplyGameplayEffectCallback(UAbilitySystemComponent* Target, const FGameplayEffectSpec& SpecApplied, FActiveGameplayEffectHandle ActiveHandle);
+	
+	// Attribute changed callbacks
+	// UFUNCTION()을 입력할 수 없음. FOnAttributeChangeData 에 뭔가 이유가 있어보임.
+	virtual void HealthChanged(const FOnAttributeChangeData& Data);
 
 	/** spawn inventory, setup initial variables */
 	virtual void PostInitializeComponents() override;
@@ -45,6 +90,7 @@ class AShooterCharacter : public ACharacter
 	*	@param	CameraLocation	Location of the Camera.
 	*	@param	CameraRotation	Rotation of the Camera.
 	*/
+public:
 	void OnCameraUpdate(const FVector& CameraLocation, const FRotator& CameraRotation);
 
 	/** get aim offsets */
@@ -132,13 +178,6 @@ class AShooterCharacter : public ACharacter
 	virtual void SetupPlayerInputComponent(class UInputComponent* InputComponent) override;
 
 	/**
-	* Handle analog trigger for firing
-	*
-	* @param Val trigger input to apply
-	*/
-	void FireTrigger(float Val);
-
-	/**
 	* Move forward/back
 	*
 	* @param Val Movment input to apply
@@ -164,13 +203,7 @@ class AShooterCharacter : public ACharacter
 
 	/* Frame rate independent lookup */
 	void LookUpAtRate(float Val);
-
-	/** player pressed start fire action */
-	void OnStartFire();
-
-	/** player released start fire action */
-	void OnStopFire();
-
+	
 	/** player pressed targeting action */
 	void OnStartTargeting();
 
@@ -186,26 +219,12 @@ class AShooterCharacter : public ACharacter
 	/** player pressed reload action */
 	void OnReload();
 
-	/** player pressed jump action */
-	void OnStartJump();
-
-	/** player released jump action */
-	void OnStopJump();
-
-	/** player pressed run action */
-	void OnStartRunning();
-
-	/** player pressed toggled run action */
-	void OnStartRunningToggle();
-
-	/** player released run action */
-	void OnStopRunning();
-
 	//////////////////////////////////////////////////////////////////////////
 	// Reading data
 
 	/** get mesh component */
-	USkeletalMeshComponent* GetPawnMesh() const;
+	UFUNCTION(BlueprintCallable)
+	USkeletalMeshComponent* GetPawnMesh(EBodyMeshType ViewType = EBodyMeshType::None) const;
 
 	/** get currently equipped weapon */
 	UFUNCTION(BlueprintCallable, Category = "Game|Weapon")
@@ -254,9 +273,6 @@ class AShooterCharacter : public ACharacter
 	UFUNCTION(BlueprintCallable, Category = Mesh)
 	virtual bool IsFirstPerson() const;
 
-	/** get max health */
-	int32 GetMaxHealth() const;
-
 	/** check if pawn is still alive */
 	bool IsAlive() const;
 
@@ -272,13 +288,17 @@ class AShooterCharacter : public ACharacter
 
 	/** Update the team color of all player meshes. */
 	void UpdateTeamColorsAllMIDs();
-private:
 
+	bool GetWantsToFire() const { return bWantsToFire; }
+	void SetWantsToFire(bool bInWantsToFire) { bWantsToFire = bInWantsToFire; }
+
+private:
 	/** pawn mesh: 1st person view */
 	UPROPERTY(VisibleDefaultsOnly, Category = Mesh)
 	USkeletalMeshComponent* Mesh1P;
-protected:
 
+protected:
+	
 	/** socket or bone name for attaching weapon mesh */
 	UPROPERTY(EditDefaultsOnly, Category = Inventory)
 	FName WeaponAttachPoint;
@@ -399,13 +419,13 @@ private:
 
 public:
 
+	virtual class UAbilitySystemComponent* GetAbilitySystemComponent() const override;
+	virtual void InitializeAttributes();
+	virtual void GiveAbilities();
+	
 	/** Identifies if pawn is in its dying state */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = Health)
 	uint32 bIsDying : 1;
-
-	// Current health of the Pawn
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Replicated, Category = Health)
-	float Health;
 
 	/** Take damage, handle death */
 	virtual float TakeDamage(float Damage, struct FDamageEvent const& DamageEvent, class AController* EventInstigator, class AActor* DamageCauser) override;
@@ -434,7 +454,28 @@ public:
 
 	/** Called on the actor right before replication occurs */
 	virtual void PreReplication(IRepChangedPropertyTracker & ChangedPropertyTracker) override;
+
+	class AShooterWeapon* GetCurrentWeapon() const { return CurrentWeapon; }
+
+	UFUNCTION(BlueprintCallable, Category = "ShooterCharacter | Attributes")
+	float GetHealth() const;
+
+	UFUNCTION(BlueprintCallable, Category = "ShooterCharacter | Attributes")
+	void SetHealth(float NewHealth);
+
+	UFUNCTION(BlueprintCallable, Category = "ShooterCharacter | Attributes")
+	float GetMaxHealth() const;
+
+	UFUNCTION(BlueprintCallable, Category = "ShooterCharacter | Attributes")
+	float GetAdditionalMoveSpeed() const;
+
+	UFUNCTION(BlueprintCallable, Category = "ShooterCharacter | Attributes")
+	void SetAdditionalMoveSpeed(float NewSpeed);
+
 protected:
+	UPROPERTY()
+	TWeakObjectPtr<AActor> LastAttacker;
+	
 	/** notification when killed, for both the server and client. */
 	virtual void OnDeath(float KillingDamage, struct FDamageEvent const& DamageEvent, class APawn* InstigatingPawn, class AActor* DamageCauser);
 
@@ -456,7 +497,7 @@ protected:
 
 	/** updates current weapon */
 	void SetCurrentWeapon(class AShooterWeapon* NewWeapon, class AShooterWeapon* LastWeapon = NULL);
-
+	
 	/** current weapon rep handler */
 	UFUNCTION()
 	void OnRep_CurrentWeapon(class AShooterWeapon* LastWeapon);

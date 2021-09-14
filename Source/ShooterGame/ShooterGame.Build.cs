@@ -33,8 +33,7 @@ public class ShooterGame : ModuleRules
 				"AssetRegistry",
 				"NavigationSystem",
 				"AIModule",
-				"GameplayTasks",
-				"Gauntlet",
+				"Gauntlet"
 			}
 		);
 
@@ -49,7 +48,10 @@ public class ShooterGame : ModuleRules
 				"ReplicationGraph",
 				"PakFile",
 				"RHI",
-				"PhysicsCore"
+				"PhysicsCore",
+				"GameplayTasks",
+				"GameplayTags",
+				"GameplayAbilities"
 			}
 		);
 

@@ -35,7 +35,7 @@ class FShooterGameModule : public FDefaultGameModuleImpl
 	}
 };
 
-IMPLEMENT_PRIMARY_GAME_MODULE(FShooterGameModule, ShooterGame, "ShootingGame01");
+IMPLEMENT_PRIMARY_GAME_MODULE(FShooterGameModule, ShooterGame, "ShooterGame");
 
 DEFINE_LOG_CATEGORY(LogShooter)
 DEFINE_LOG_CATEGORY(LogShooterWeapon)

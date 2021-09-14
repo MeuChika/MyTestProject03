@@ -13,14 +13,12 @@ UCLASS(Abstract, Blueprintable)
 class AShooterPickup_Ammo : public AShooterPickup
 {
 	GENERATED_UCLASS_BODY()
-
 	/** check if pawn can use this pickup */
 	virtual bool CanBePickedUp(AShooterCharacter* TestPawn) const override;
 
 	bool IsForWeapon(UClass* WeaponClass);
 
 protected:
-
 	/** how much ammo does it give? */
 	UPROPERTY(EditDefaultsOnly, Category=Pickup)
 	int32 AmmoClips;

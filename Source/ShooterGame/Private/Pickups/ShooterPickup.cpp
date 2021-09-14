@@ -3,6 +3,7 @@
 #include "ShooterGame.h"
 #include "Pickups/ShooterPickup.h"
 #include "Particles/ParticleSystemComponent.h"
+#include "MyAbilitySystemComponent.h"
 
 AShooterPickup::AShooterPickup(const FObjectInitializer& ObjectInitializer) : Super(ObjectInitializer)
 {
@@ -21,7 +22,7 @@ AShooterPickup::AShooterPickup(const FObjectInitializer& ObjectInitializer) : Su
 
 	RespawnTime = 10.0f;
 	bIsActive = false;
-	PickedUpBy = NULL;
+	PickedUpBy = nullptr;
 
 	SetRemoteRoleForBackwardsCompat(ROLE_SimulatedProxy);
 	bReplicates = true;
@@ -54,6 +55,15 @@ bool AShooterPickup::CanBePickedUp(class AShooterCharacter* TestPawn) const
 
 void AShooterPickup::GivePickupTo(class AShooterCharacter* Pawn)
 {
+	if(EffectToApply == nullptr) return;
+	
+	if (IsValid(Pawn))
+	{
+		if (Pawn->GetAbilitySystemComponent())
+		{
+			Pawn->GetAbilitySystemComponent()->ApplyGameplayEffectToSelf(EffectToApply.GetDefaultObject(),1.f,FGameplayEffectContextHandle());
+		}
+	}
 }
 
 void AShooterPickup::PickupOnTouch(class AShooterCharacter* Pawn)
@@ -82,7 +92,7 @@ void AShooterPickup::PickupOnTouch(class AShooterCharacter* Pawn)
 void AShooterPickup::RespawnPickup()
 {
 	bIsActive = true;
-	PickedUpBy = NULL;
+	PickedUpBy = nullptr;
 	OnRespawned();
 
 	TSet<AActor*> OverlappingPawns;
